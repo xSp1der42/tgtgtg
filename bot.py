@@ -132,11 +132,25 @@ async def check_subscription(bot: Bot, user_id: int) -> bool:
         except: return False
     return True
 
-async def get_owner_id(connection_id: str) -> int:
+# ФИКС ДЛЯ RENDER: восстанавливаем connection_id из Telegram API, если база стерлась
+async def get_owner_id(bot: Bot, connection_id: str) -> int:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM business_connections WHERE connection_id = ?", (connection_id,)) as c:
             row = await c.fetchone()
-            return row[0] if row else None
+            if row: return row[0]
+                
+    try:
+        conn = await bot.get_business_connection(connection_id)
+        if conn and conn.user:
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id) VALUES (?, ?)", (connection_id, conn.user.id))
+                await db.commit()
+            logging.info(f"🔄 Восстановлена связь для пользователя {conn.user.id}")
+            return conn.user.id
+    except Exception as e:
+        logging.error(f"Не удалось получить бизнес-подключение: {e}")
+        
+    return None
 
 def extract_media(message: Message):
     file_id = None; content_type = message.content_type; text = message.text or message.caption or ""
@@ -182,14 +196,25 @@ async def on_business_connection(connection: BusinessConnection, bot: Bot):
 
 @router.business_message()
 async def on_new_business_message(message: Message, bot: Bot):
-    owner_id = await get_owner_id(message.business_connection_id)
-    if not owner_id or not await check_subscription(bot, owner_id): return
+    owner_id = await get_owner_id(bot, message.business_connection_id)
+    if not owner_id:
+        logging.warning("⚠️ Сообщение получено, но владелец не определен!")
+        return
+        
+    if not await check_subscription(bot, owner_id): return
     
     text_lower = (message.text or message.caption or "").lower()
     text = message.text or message.caption or ""
 
     # ⚡️ БЛОК 1: КОМАНДЫ ВЛАДЕЛЬЦА
     if message.from_user.id == owner_id and text.startswith("."):
+        
+        # 🔥 УДАЛЕНИЕ СООБЩЕНИЯ С КОМАНДОЙ (ЧТОБЫ НЕ ПАЛИТЬСЯ)
+        try:
+            await message.delete()
+        except Exception as e:
+            logging.error(f"Не удалось удалить команду: {e}")
+
         parts = text.split()
         cmd = parts[0].lower()
 
@@ -533,7 +558,7 @@ async def on_new_business_message(message: Message, bot: Bot):
 
 @router.edited_business_message()
 async def on_edited_business_message(message: Message, bot: Bot):
-    owner_id = await get_owner_id(message.business_connection_id)
+    owner_id = await get_owner_id(bot, message.business_connection_id)
     if not owner_id or not await check_subscription(bot, owner_id): return
     settings = await get_user_settings(owner_id)
     if settings['paused'] or not settings['edited']: return
@@ -572,7 +597,7 @@ async def on_edited_business_message(message: Message, bot: Bot):
 
 @router.deleted_business_messages()
 async def on_deleted_business_messages(deleted: BusinessMessagesDeleted, bot: Bot):
-    owner_id = await get_owner_id(deleted.business_connection_id)
+    owner_id = await get_owner_id(bot, deleted.business_connection_id)
     if not owner_id or not await check_subscription(bot, owner_id): return
     settings = await get_user_settings(owner_id)
     if settings['paused'] or not settings['deleted']: return
