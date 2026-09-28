@@ -1,0 +1,15 @@
+# Секретные ключи
+.env
+
+# База данных
+*.db
+*.sqlite3
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Виртуальное окружение
+venv/
+env/
