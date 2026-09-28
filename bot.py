@@ -29,7 +29,7 @@ if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("❌ ОШИБКА: BOT_TOKEN или ADMIN_ID не найдены в файле .env!")
 
 DB_NAME = "business_messages.db"
-BOT_USERNAME = "@allmessagebot "
+BOT_USERNAME = "@nodelchat_bot"
 CHANNELS = ["@xSp1der42", "@neon9_news"]
 BOT_START_TIME = datetime.now()
 MESSAGE_RETENTION_TIME = 604800 # 7 дней
