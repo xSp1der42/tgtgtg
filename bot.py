@@ -30,7 +30,8 @@ if not BOT_TOKEN or not ADMIN_ID:
 
 DB_NAME = "business_messages.db"
 BOT_USERNAME = "@nodelchat_bot"
-CHANNELS = ["@xSp1der42", "@neon9_news"]
+# ДОБАВЛЕН НОВЫЙ КАНАЛ В СПИСОК
+CHANNELS = ["@xSp1der42", "@neon9_news", "@RiffyOff"] 
 BOT_START_TIME = datetime.now()
 MESSAGE_RETENTION_TIME = 604800 # 7 дней
 
@@ -51,7 +52,6 @@ router = Router()
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Основные таблицы
         await db.execute("""CREATE TABLE IF NOT EXISTS messages_v2 (
             connection_id TEXT, chat_id INTEGER, message_id INTEGER,
             sender_name TEXT, sender_username TEXT, text TEXT,
@@ -63,20 +63,25 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, catch_deleted INTEGER DEFAULT 1, catch_edited INTEGER DEFAULT 1, is_paused INTEGER DEFAULT 0)")
         await db.execute("CREATE TABLE IF NOT EXISTS bot_stats (stat_name TEXT PRIMARY KEY, stat_value INTEGER DEFAULT 0)")
         
-        # Таблицы юзербота
         await db.execute("CREATE TABLE IF NOT EXISTS autoreplies (owner_id INTEGER, target_chat_id INTEGER, reply_text TEXT, PRIMARY KEY (owner_id, target_chat_id))")
         await db.execute("CREATE TABLE IF NOT EXISTS user_notes (owner_id INTEGER, note_name TEXT, note_text TEXT, PRIMARY KEY (owner_id, note_name))")
         await db.execute("CREATE TABLE IF NOT EXISTS global_status (owner_id INTEGER PRIMARY KEY, status_text TEXT, is_active INTEGER DEFAULT 0)")
         await db.execute("CREATE TABLE IF NOT EXISTS keyword_replies (owner_id INTEGER, keyword TEXT, reply_text TEXT, PRIMARY KEY (owner_id, keyword))")
         await db.execute("CREATE TABLE IF NOT EXISTS watched_words (owner_id INTEGER, word TEXT, PRIMARY KEY (owner_id, word))")
         
-        # НОВАЯ ТАБЛИЦА: Архив удаленных сообщений
         await db.execute("""CREATE TABLE IF NOT EXISTS archive_deleted (
             owner_id INTEGER, chat_id INTEGER, sender_name TEXT, 
-            text TEXT, date INTEGER)""")
+            text TEXT, date INTEGER, file_id TEXT, content_type TEXT)""")
         
         await db.execute("INSERT OR IGNORE INTO bot_stats (stat_name, stat_value) VALUES ('deleted_caught', 0)")
         await db.execute("INSERT OR IGNORE INTO bot_stats (stat_name, stat_value) VALUES ('edited_caught', 0)")
+        
+        # Миграция старой таблицы archive_deleted, если нужно добавить колонки для медиа
+        try: await db.execute("ALTER TABLE archive_deleted ADD COLUMN file_id TEXT")
+        except: pass
+        try: await db.execute("ALTER TABLE archive_deleted ADD COLUMN content_type TEXT")
+        except: pass
+
         await db.commit()
 
 async def db_cleanup_task():
@@ -128,11 +133,11 @@ async def check_subscription(bot: Bot, user_id: int) -> bool:
     if user_id == ADMIN_ID: return True
     for channel in CHANNELS:
         try:
-            if (await bot.get_chat_member(chat_id=channel, user_id=user_id)).status in ['left', 'kicked', 'banned']: return False
+            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status in ['left', 'kicked', 'banned']: return False
         except: return False
     return True
 
-# ФИКС ДЛЯ RENDER: восстанавливаем connection_id из Telegram API, если база стерлась
 async def get_owner_id(bot: Bot, connection_id: str) -> int:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM business_connections WHERE connection_id = ?", (connection_id,)) as c:
@@ -145,7 +150,6 @@ async def get_owner_id(bot: Bot, connection_id: str) -> int:
             async with aiosqlite.connect(DB_NAME) as db:
                 await db.execute("INSERT OR REPLACE INTO business_connections (connection_id, user_id) VALUES (?, ?)", (connection_id, conn.user.id))
                 await db.commit()
-            logging.info(f"🔄 Восстановлена связь для пользователя {conn.user.id}")
             return conn.user.id
     except Exception as e:
         logging.error(f"Не удалось получить бизнес-подключение: {e}")
@@ -180,7 +184,7 @@ async def send_media_alert(bot: Bot, target_id: int, file_id: str, content_type:
                 if content_type == 'video_note': await bot.send_video_note(target_id, file_id)
                 else: await bot.send_sticker(target_id, file_id)
         else: await bot.send_message(target_id, caption)
-    except: await bot.send_message(target_id, f"{caption}\n\n⚠️ <i>[Файл недоступен]</i>")
+    except: await bot.send_message(target_id, f"{caption}\n\n⚠️ <i>[Файл недоступен для пересылки]</i>")
 
 # ================= ОБРАБОТЧИКИ БИЗНЕС-СООБЩЕНИЙ =================
 
@@ -197,37 +201,27 @@ async def on_business_connection(connection: BusinessConnection, bot: Bot):
 @router.business_message()
 async def on_new_business_message(message: Message, bot: Bot):
     owner_id = await get_owner_id(bot, message.business_connection_id)
-    if not owner_id:
-        logging.warning("⚠️ Сообщение получено, но владелец не определен!")
-        return
-        
+    if not owner_id: return
     if not await check_subscription(bot, owner_id): return
     
     text_lower = (message.text or message.caption or "").lower()
     text = message.text or message.caption or ""
 
-    # ⚡️ БЛОК 1: КОМАНДЫ ВЛАДЕЛЬЦА
+    # ⚡️ КОМАНДЫ ЮЗЕРБОТА
     if message.from_user.id == owner_id and text.startswith("."):
-        
-        # 🔥 УДАЛЕНИЕ СООБЩЕНИЯ С КОМАНДОЙ (ЧТОБЫ НЕ ПАЛИТЬСЯ)
-        try:
-            await message.delete()
-        except Exception as e:
-            logging.error(f"Не удалось удалить команду: {e}")
+        try: await message.delete()
+        except: pass
 
         parts = text.split()
         cmd = parts[0].lower()
 
         try:
-            # --- ИСТОРИЯ, ИНФО И АРХИВ ---
             if cmd == ".history" and len(parts) >= 2:
                 limit = min(int(parts[1]), 500)
                 async with aiosqlite.connect(DB_NAME) as db:
                     async with db.execute("SELECT date, sender_name, text FROM messages_v2 WHERE chat_id = ? ORDER BY date DESC LIMIT ?", (message.chat.id, limit)) as cursor:
                         rows = await cursor.fetchall()
-                if not rows:
-                    await bot.send_message(chat_id=message.chat.id, text="📭 История пуста.", business_connection_id=message.business_connection_id)
-                    return
+                if not rows: return await bot.send_message(chat_id=message.chat.id, text="📭 История пуста.", business_connection_id=message.business_connection_id)
                 history_text = f"История чата {message.chat.id}\n\n"
                 for r in reversed(rows):
                     dt = datetime.fromtimestamp(r[0]).strftime('%Y-%m-%d %H:%M')
@@ -242,9 +236,7 @@ async def on_new_business_message(message: Message, bot: Bot):
                 async with aiosqlite.connect(DB_NAME) as db:
                     async with db.execute("SELECT date, sender_name, text FROM archive_deleted WHERE owner_id = ? AND chat_id = ? AND date > ? ORDER BY date DESC", (owner_id, message.chat.id, time_limit)) as cursor:
                         rows = await cursor.fetchall()
-                if not rows:
-                    await bot.send_message(chat_id=message.chat.id, text=f"🗑 За {hours}ч удаленных сообщений не найдено.", business_connection_id=message.business_connection_id)
-                    return
+                if not rows: return await bot.send_message(chat_id=message.chat.id, text=f"🗑 За {hours}ч удаленных сообщений не найдено.", business_connection_id=message.business_connection_id)
                 history_text = f"Удаленные сообщения за {hours}ч\n\n"
                 for r in reversed(rows):
                     dt = datetime.fromtimestamp(r[0]).strftime('%Y-%m-%d %H:%M')
@@ -266,66 +258,49 @@ async def on_new_business_message(message: Message, bot: Bot):
 
             elif cmd == ".info":
                 async with aiosqlite.connect(DB_NAME) as db:
-                    async with db.execute("SELECT COUNT(*) FROM messages_v2 WHERE chat_id = ?", (message.chat.id,)) as cursor:
-                        count = (await cursor.fetchone())[0]
+                    async with db.execute("SELECT COUNT(*) FROM messages_v2 WHERE chat_id = ?", (message.chat.id,)) as cursor: count = (await cursor.fetchone())[0]
                 await bot.send_message(chat_id=message.chat.id, text=f"ℹ️ <b>Инфо о чате:</b>\nID: <code>{message.chat.id}</code>\nСообщений в базе: {count}", business_connection_id=message.business_connection_id)
                 return
 
-            # --- УТИЛИТЫ И ТУЛЗЫ ---
             elif cmd == ".calc" and len(parts) >= 2:
                 expr = text.split(" ", 1)[1].replace(" ", "")
                 if re.match(r'^[0-9+\-*/().]+$', expr):
                     try: result = eval(expr)
                     except: result = "Ошибка вычисления"
                 else: result = "Недопустимые символы (только цифры и + - * /)"
-                await bot.send_message(message.chat.id, f"🧮 <b>Результат:</b> {result}", business_connection_id=message.business_connection_id)
-                return
+                await bot.send_message(message.chat.id, f"🧮 <b>Результат:</b> {result}", business_connection_id=message.business_connection_id); return
 
             elif cmd == ".qr" and len(parts) >= 2:
-                data = text.split(" ", 1)[1]
-                qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=512x512&data={urllib.parse.quote(data)}"
-                await bot.send_photo(message.chat.id, photo=qr_url, caption="📲 Твой QR-код", business_connection_id=message.business_connection_id)
-                return
+                qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=512x512&data={urllib.parse.quote(text.split(' ', 1)[1])}"
+                await bot.send_photo(message.chat.id, photo=qr_url, caption="📲 Твой QR-код", business_connection_id=message.business_connection_id); return
 
             elif cmd == ".short" and len(parts) >= 2:
-                long_url = text.split(" ", 1)[1]
-                api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
+                api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(text.split(' ', 1)[1])}"
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(api_url) as resp:
-                        short_url = await resp.text() if resp.status == 200 else "Ошибка сокращения"
-                await bot.send_message(message.chat.id, f"🔗 <b>Короткая ссылка:</b>\n{short_url}", business_connection_id=message.business_connection_id)
-                return
-                
+                    async with session.get(api_url) as resp: short_url = await resp.text() if resp.status == 200 else "Ошибка"
+                await bot.send_message(message.chat.id, f"🔗 <b>Короткая ссылка:</b>\n{short_url}", business_connection_id=message.business_connection_id); return
+
             elif cmd == ".unshort" and len(parts) >= 2:
                 short_url = text.split(" ", 1)[1]
                 if not short_url.startswith("http"): short_url = "https://" + short_url
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(short_url, allow_redirects=True) as resp:
-                        final_url = str(resp.url)
-                await bot.send_message(message.chat.id, f"🕵️‍♂️ <b>Оригинальная ссылка:</b>\n{final_url}", business_connection_id=message.business_connection_id)
-                return
+                    async with session.get(short_url, allow_redirects=True) as resp: final_url = str(resp.url)
+                await bot.send_message(message.chat.id, f"🕵️‍♂️ <b>Оригинальная ссылка:</b>\n{final_url}", business_connection_id=message.business_connection_id); return
 
             elif cmd == ".time": await bot.send_message(message.chat.id, f"🕒 {datetime.now().strftime('%H:%M:%S')}", business_connection_id=message.business_connection_id); return
             elif cmd == ".date": await bot.send_message(message.chat.id, f"📅 {datetime.now().strftime('%d.%m.%Y')}", business_connection_id=message.business_connection_id); return
 
-            # --- ФОРМАТИРОВАНИЕ ТЕКСТА ---
             elif cmd == ".bold": await bot.send_message(message.chat.id, f"<b>{html.escape(text.split(' ', 1)[1])}</b>", business_connection_id=message.business_connection_id); return
             elif cmd == ".italic": await bot.send_message(message.chat.id, f"<i>{html.escape(text.split(' ', 1)[1])}</i>", business_connection_id=message.business_connection_id); return
             elif cmd == ".mono": await bot.send_message(message.chat.id, f"<code>{html.escape(text.split(' ', 1)[1])}</code>", business_connection_id=message.business_connection_id); return
-            elif cmd == ".anticaps" and len(parts) >= 2:
-                res = text.split(" ", 1)[1].capitalize()
-                await bot.send_message(message.chat.id, res, business_connection_id=message.business_connection_id)
-                return
             
             elif cmd == ".b64en" and len(parts) >= 2:
-                res = base64.b64encode(text.split(" ", 1)[1].encode()).decode()
-                await bot.send_message(message.chat.id, f"🔐 <code>{res}</code>", business_connection_id=message.business_connection_id); return
+                await bot.send_message(message.chat.id, f"🔐 <code>{base64.b64encode(text.split(' ', 1)[1].encode()).decode()}</code>", business_connection_id=message.business_connection_id); return
             elif cmd == ".b64de" and len(parts) >= 2:
                 try: res = base64.b64decode(text.split(" ", 1)[1].encode()).decode()
                 except: res = "❌ Ошибка декодирования"
                 await bot.send_message(message.chat.id, f"🔓 {res}", business_connection_id=message.business_connection_id); return
 
-            # --- УМНЫЕ АВТООТВЕТЫ И СТАТУСЫ ---
             elif cmd == ".status":
                 if len(parts) == 2 and parts[1].lower() == "off":
                     async with aiosqlite.connect(DB_NAME) as db:
@@ -366,7 +341,6 @@ async def on_new_business_message(message: Message, bot: Bot):
                     await bot.send_message(owner_id, f"🤖 <b>Твои автоответы:</b>\n{res}")
                 return
 
-            # --- НАБЛЮДАТЕЛЬ (WATCH) ---
             elif cmd == ".watch" and len(parts) >= 2:
                 word = parts[1].lower()
                 async with aiosqlite.connect(DB_NAME) as db:
@@ -383,28 +357,22 @@ async def on_new_business_message(message: Message, bot: Bot):
                 return
             elif cmd == ".watch_list":
                 async with aiosqlite.connect(DB_NAME) as db:
-                    async with db.execute("SELECT word FROM watched_words WHERE owner_id = ?", (owner_id,)) as cursor:
-                        rows = await cursor.fetchall()
+                    async with db.execute("SELECT word FROM watched_words WHERE owner_id = ?", (owner_id,)) as cursor: rows = await cursor.fetchall()
                 if not rows: await bot.send_message(owner_id, "📭 Ты ни за чем не наблюдаешь.")
                 else:
                     res = ", ".join([f"<code>{r[0]}</code>" for r in rows])
                     await bot.send_message(owner_id, f"👁 <b>Ты следишь за словами:</b>\n{res}")
                 return
 
-            # --- ПЛАНИРОВЩИК, ШАБЛОНЫ И ДРУГОЕ ---
             elif cmd == ".remind" and len(parts) >= 3:
-                time_str = parts[1]
-                remind_text = text.split(" ", 2)[2]
-                multiplier = 60
+                time_str = parts[1]; remind_text = text.split(" ", 2)[2]; multiplier = 60
                 if time_str.endswith("h"): multiplier = 3600; time_str = time_str[:-1]
                 elif time_str.endswith("m"): time_str = time_str[:-1]
                 seconds = float(time_str) * multiplier
-                
                 async def send_later(c_id, b_id, txt, delay_sec):
                     await asyncio.sleep(delay_sec)
                     try: await bot.send_message(chat_id=c_id, text=f"⏰ Напоминание:\n{txt}", business_connection_id=b_id)
                     except: pass
-                    
                 asyncio.create_task(send_later(message.chat.id, message.business_connection_id, remind_text, seconds))
                 await bot.send_message(owner_id, f"⏳ Запланировано через {time_str} {'часов' if multiplier==3600 else 'минут'}.")
                 return
@@ -415,19 +383,6 @@ async def on_new_business_message(message: Message, bot: Bot):
                 for _ in range(count):
                     await bot.send_message(chat_id=message.chat.id, text=spam_text, business_connection_id=message.business_connection_id)
                     await asyncio.sleep(0.4)
-                return
-
-            elif cmd == ".action" and len(parts) >= 3:
-                act_type = parts[1].lower()
-                sec = min(int(parts[2]), 60)
-                tg_action = "typing"
-                if act_type == "voice": tg_action = "record_voice"
-                elif act_type == "video": tg_action = "record_video_note"
-                for _ in range(sec // 5 + 1):
-                    await bot.send_chat_action(chat_id=message.chat.id, action=tg_action, business_connection_id=message.business_connection_id)
-                    await asyncio.sleep(min(5, sec))
-                    sec -= 5
-                    if sec <= 0: break
                 return
 
             elif cmd == ".boom" and len(parts) >= 3:
@@ -442,17 +397,8 @@ async def on_new_business_message(message: Message, bot: Bot):
                 return
 
             elif cmd == ".tr" and len(parts) >= 3:
-                target_lang = parts[1].lower()
-                orig_text = text.split(" ", 2)[2]
-                translated = await translate_text(target_lang, orig_text)
-                await bot.send_message(chat_id=message.chat.id, text=translated, business_connection_id=message.business_connection_id)
-                return
-
-            elif cmd == ".clown" and len(parts) >= 2:
-                orig_text = text.split(" ", 1)[1]
-                clown_text = "".join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(orig_text))
-                await bot.send_message(chat_id=message.chat.id, text=clown_text, business_connection_id=message.business_connection_id)
-                return
+                translated = await translate_text(parts[1].lower(), text.split(" ", 2)[2])
+                await bot.send_message(chat_id=message.chat.id, text=translated, business_connection_id=message.business_connection_id); return
 
             elif cmd == ".save" and len(parts) >= 3:
                 note_name = parts[1].lower()
@@ -463,19 +409,14 @@ async def on_new_business_message(message: Message, bot: Bot):
                 await bot.send_message(owner_id, f"✅ Заметка <code>.{note_name}</code> сохранена!")
                 return
             elif cmd == ".del" and len(parts) >= 2:
-                note_name = parts[1].lower()
                 async with aiosqlite.connect(DB_NAME) as db:
-                    await db.execute("DELETE FROM user_notes WHERE owner_id = ? AND note_name = ?", (owner_id, note_name))
+                    await db.execute("DELETE FROM user_notes WHERE owner_id = ? AND note_name = ?", (owner_id, parts[1].lower()))
                     await db.commit()
-                await bot.send_message(owner_id, f"🗑 Заметка <code>.{note_name}</code> удалена.")
-                return
+                await bot.send_message(owner_id, f"🗑 Заметка <code>.{parts[1].lower()}</code> удалена."); return
             elif cmd == ".notes":
                 async with aiosqlite.connect(DB_NAME) as db:
-                    async with db.execute("SELECT note_name FROM user_notes WHERE owner_id = ?", (owner_id,)) as cursor:
-                        notes = await cursor.fetchall()
-                if notes:
-                    n_list = "\n".join([f"• <code>.{n[0]}</code>" for n in notes])
-                    await bot.send_message(owner_id, f"🗂 <b>Шаблоны:</b>\n{n_list}")
+                    async with db.execute("SELECT note_name FROM user_notes WHERE owner_id = ?", (owner_id,)) as cursor: notes = await cursor.fetchall()
+                if notes: await bot.send_message(owner_id, f"🗂 <b>Шаблоны:</b>\n" + "\n".join([f"• <code>.{n[0]}</code>" for n in notes]))
                 else: await bot.send_message(owner_id, "🤷‍♂️ У тебя пока нет шаблонов.")
                 return
 
@@ -484,18 +425,15 @@ async def on_new_business_message(message: Message, bot: Bot):
                 async with aiosqlite.connect(DB_NAME) as db:
                     await db.execute("INSERT OR REPLACE INTO autoreplies (owner_id, target_chat_id, reply_text) VALUES (?, ?, ?)", (owner_id, message.chat.id, reply_text))
                     await db.commit()
-                await bot.send_message(owner_id, f"✅ <b>Автоответчик включен</b>!\nТекст: {reply_text}")
-                return
+                await bot.send_message(owner_id, f"✅ <b>Автоответчик включен</b>!\nТекст: {reply_text}"); return
             elif cmd == ".autostop":
                 async with aiosqlite.connect(DB_NAME) as db:
                     await db.execute("DELETE FROM autoreplies WHERE owner_id = ? AND target_chat_id = ?", (owner_id, message.chat.id))
                     await db.commit()
-                await bot.send_message(owner_id, "❌ <b>Автоответчик выключен</b>.")
-                return
+                await bot.send_message(owner_id, "❌ <b>Автоответчик выключен</b>."); return
             else:
-                note_name = cmd.replace(".", "")
                 async with aiosqlite.connect(DB_NAME) as db:
-                    async with db.execute("SELECT note_text FROM user_notes WHERE owner_id = ? AND note_name = ?", (owner_id, note_name)) as cursor:
+                    async with db.execute("SELECT note_text FROM user_notes WHERE owner_id = ? AND note_name = ?", (owner_id, cmd.replace(".", ""))) as cursor:
                         row = await cursor.fetchone()
                         if row:
                             await bot.send_message(chat_id=message.chat.id, text=row[0], business_connection_id=message.business_connection_id)
@@ -505,11 +443,9 @@ async def on_new_business_message(message: Message, bot: Bot):
             logging.error(f"Ошибка юзербота: {e}")
             return
 
-    # ⚡️ БЛОК 2: АНАЛИЗ ВХОДЯЩИХ (от собеседника)
+    # ⚡️ АНАЛИЗ ВХОДЯЩИХ
     if message.from_user.id != owner_id:
         async with aiosqlite.connect(DB_NAME) as db:
-            
-            # 1. Индивидуальный автоответчик (.auto)
             async with db.execute("SELECT reply_text FROM autoreplies WHERE owner_id = ? AND target_chat_id = ?", (owner_id, message.chat.id)) as c:
                 row = await c.fetchone()
                 if row:
@@ -517,31 +453,25 @@ async def on_new_business_message(message: Message, bot: Bot):
                     except: pass
                     return
 
-            # 2. Глобальный статус
             async with db.execute("SELECT status_text FROM global_status WHERE owner_id = ? AND is_active = 1", (owner_id,)) as c:
                 status = await c.fetchone()
                 if status:
                     try: await bot.send_message(message.chat.id, f"🤖 [Автоответ]: {status[0]}", business_connection_id=message.business_connection_id)
                     except: pass
             
-            # 3. Проверка Триггеров (Ключевых слов)
             async with db.execute("SELECT keyword, reply_text FROM keyword_replies WHERE owner_id = ?", (owner_id,)) as c:
-                kws = await c.fetchall()
-                for kw, reply in kws:
+                for kw, reply in await c.fetchall():
                     if kw in text_lower:
                         try: await bot.send_message(message.chat.id, reply, business_connection_id=message.business_connection_id)
                         except: pass
                         break
 
-            # 4. Проверка Наблюдателя (.watch)
             async with db.execute("SELECT word FROM watched_words WHERE owner_id = ?", (owner_id,)) as c:
-                watched = await c.fetchall()
-                for (w,) in watched:
+                for (w,) in await c.fetchall():
                     if w in text_lower:
-                        sender = message.from_user.full_name
-                        await bot.send_message(owner_id, f"👁 <b>Сработал триггер!</b>\nПользователь <b>{sender}</b> (ID: <code>{message.chat.id}</code>) написал слово <code>{w}</code>.\n\nТекст: <i>{text}</i>")
+                        await bot.send_message(owner_id, f"👁 <b>Сработал триггер!</b>\nПользователь <b>{message.from_user.full_name}</b> написал слово <code>{w}</code>.\n\nТекст: <i>{text}</i>")
 
-    # ⚡️ БЛОК 3: ПЕРЕХВАТ И СОХРАНЕНИЕ
+    # ⚡️ ПЕРЕХВАТ
     settings = await get_user_settings(owner_id)
     if settings['paused']: return
 
@@ -571,7 +501,7 @@ async def on_edited_business_message(message: Message, bot: Bot):
                               (message.business_connection_id, message.chat.id, message.message_id)) as cursor:
             row = await cursor.fetchone()
 
-        old_text = row[0] if row else "[Текст не был сохранен]"
+        old_text = row[0] if row else "[Текст не сохранен]"
         old_file_id = row[1] if row else None
         old_content_type = row[2] if row else "text"
 
@@ -588,7 +518,6 @@ async def on_edited_business_message(message: Message, bot: Bot):
     caption = f"✏️ <b>{author_str} ИЗМЕНИЛ(А):</b>\n\n<b>Было:</b>\n"
     if safe_old: caption += f"<blockquote>{safe_old}</blockquote>\n"
     elif old_file_id: caption += f"<i>[Медиа: {old_content_type}]</i>\n"
-    
     caption += f"\n<b>Стало:</b>\n"
     if safe_new: caption += f"<blockquote>{safe_new}</blockquote>\n"
     elif new_file_id: caption += f"<i>[Медиа: {new_content_type}]</i>\n"
@@ -611,9 +540,8 @@ async def on_deleted_business_messages(deleted: BusinessMessagesDeleted, bot: Bo
             if row:
                 s_name, s_uname, text, file_id, c_type, msg_date = row
                 
-                # Добавляем в архив удаленных
-                await db.execute("INSERT INTO archive_deleted (owner_id, chat_id, sender_name, text, date) VALUES (?, ?, ?, ?, ?)",
-                                 (owner_id, deleted.chat.id, s_name, text, msg_date))
+                await db.execute("INSERT INTO archive_deleted (owner_id, chat_id, sender_name, text, date, file_id, content_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 (owner_id, deleted.chat.id, s_name, text, msg_date, file_id, c_type))
 
                 author = f"{s_name}" + (f" (@{s_uname})" if s_uname else "")
                 safe_text = html.escape(text) if text else ""
@@ -627,7 +555,19 @@ async def on_deleted_business_messages(deleted: BusinessMessagesDeleted, bot: Bo
                 await db.execute("DELETE FROM messages_v2 WHERE connection_id = ? AND chat_id = ? AND message_id = ?", (deleted.business_connection_id, deleted.chat.id, msg_id))
         await db.commit()
 
-# ================= ОБРАБОТЧИКИ БОТА В ЛС =================
+# ================= ОБРАБОТЧИКИ UI В ЛИЧНЫХ СООБЩЕНИЯХ =================
+
+def get_main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Инструкция (ВАЖНО!)", callback_data="tab_instructions")],
+        [InlineKeyboardButton(text="⚡️ Что умеет бот?", callback_data="tab_features")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="tab_settings")]
+    ])
+
+def get_back_button():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_main")]
+    ])
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
@@ -635,32 +575,21 @@ async def cmd_start(message: Message, bot: Bot):
     if not await check_subscription(bot, message.from_user.id):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Канал 1", url="https://t.me/xSp1der42"), InlineKeyboardButton(text="📢 Канал 2", url="https://t.me/neon9_news")],
+            [InlineKeyboardButton(text="📢 Канал 3", url="https://t.me/RiffyOff")],
             [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
         ])
-        return await message.answer("❌ <b>ОШИБКА ДОСТУПА</b>\nПодпишитесь на каналы, чтобы использовать бота.", reply_markup=keyboard)
+        text = "🔓 <b>Бот ПОЛНОСТЬЮ БЕСПЛАТНЫЙ!</b>\n\nНо для доступа к его функциям, пожалуйста, подпишись на каналы наших спонсоров:"
+        return await message.answer(text, reply_markup=keyboard)
 
     welcome = (
-        f"👋 <b>Привет! Я {BOT_USERNAME} — ультимативный шпион и комбайн.</b>\n\n"
-        "⚡️ <b>СЕКРЕТНЫЕ КОМАНДЫ В ЧАТАХ:</b>\n"
-        "🔎 <b>Инфо и Архивы:</b>\n"
-        "<code>.history 50</code> — Скачать файл с историей сообщений\n"
-        "<code>.deleted 24</code> — Скачать файл удаленных за 24 часа\n"
-        "<code>.find Текст</code> — Найти слово в переписке\n\n"
-        "🤖 <b>Автоответы и Триггеры:</b>\n"
-        "<code>.status Я сплю</code> — Автоответчик ВСЕМ\n"
-        "<code>.kw_add слово -> ответ</code> — Автоответ на фразу\n"
-        "<code>.watch слово</code> — Уведомлять, если кто-то скажет слово\n"
-        "<i>(Управление: .kw_list, .kw_del, .watch_list, .unwatch)</i>\n\n"
-        "🛠 <b>Утилиты:</b>\n"
-        "<code>.calc 2+2</code>, <code>.qr текст</code>, <code>.short ссылка</code>\n"
-        "<code>.remind 5m текст</code> — Отложенная отправка через 5 минут\n"
-        "<code>.tr en текст</code> — Переводчик\n"
-        "<code>.boom 5 текст</code> — Самоуничтожение (через 5 сек)\n\n"
-        "⚙️ <b>Настройки перехвата:</b> /settings"
+        f"👋 <b>Привет! Я {BOT_USERNAME} — твой личный шпион и ассистент.</b>\n\n"
+        "Главная моя фишка: <b>я перехватываю удаленные и измененные сообщения</b> в твоих переписках (включая фото, видео и кружочки)!\n\n"
+        "Выбери нужный раздел ниже 👇"
     )
     if message.from_user.id == ADMIN_ID:
-        welcome += "\n\n🛠 <b>Админ:</b> /stats, /backup, /updatenotify"
-    await message.answer(welcome)
+        welcome += "\n\n🛠 <b>Админ команды:</b> /stats, /backup, /updatenotify"
+        
+    await message.answer(welcome, reply_markup=get_main_menu_kb())
 
 @router.callback_query(F.data == "check_sub")
 async def cb_check_sub(call: CallbackQuery, bot: Bot):
@@ -668,17 +597,78 @@ async def cb_check_sub(call: CallbackQuery, bot: Bot):
         await call.message.delete()
         await cmd_start(call.message, bot)
     else:
-        await call.answer("❌ Вы не подписались на каналы!", show_alert=True)
+        await call.answer("❌ Вы не подписались на все каналы!", show_alert=True)
 
-@router.message(Command("settings"))
-async def cmd_settings(message: Message):
-    settings = await get_user_settings(message.from_user.id)
+@router.callback_query(F.data == "back_main")
+async def cb_back_main(call: CallbackQuery):
+    text = (
+        f"👋 <b>Главное меню</b>\n\n"
+        "Главная моя фишка: <b>я перехватываю удаленные и измененные сообщения</b> в твоих переписках!\n\n"
+        "Выбери нужный раздел ниже 👇"
+    )
+    await call.message.edit_text(text, reply_markup=get_main_menu_kb())
+
+@router.callback_query(F.data == "tab_instructions")
+async def cb_tab_instructions(call: CallbackQuery):
+    text = (
+        "📖 <b>КАК УСТАНОВИТЬ БОТА (ИНСТРУКЦИЯ)</b>\n\n"
+        "Чтобы я начал перехватывать сообщения и отвечать на твои команды, сделай следующее:\n\n"
+        "1️⃣ Открой <b>Настройки Telegram</b>\n"
+        "2️⃣ Перейди в раздел <b>Telegram для бизнеса</b> (нужен Premium)\n"
+        "3️⃣ Выбери <b>Чат-боты</b>\n"
+        f"4️⃣ Введи мой юзернейм: <code>{BOT_USERNAME}</code>\n"
+        "5️⃣ Нажми <b>Добавить</b>\n\n"
+        "🚨 <b>САМОЕ ВАЖНОЕ (ЧТОБЫ РАБОТАЛИ КОМАНДЫ):</b>\n"
+        "После добавления убедись, что галочка <b>«Может отвечать на сообщения»</b> ВКЛЮЧЕНА!\n"
+        "Также в настройках чатов для бота нужно выбрать <b>«Все чаты»</b> (или те, которые нужны). Если не дать боту права отвечать, ты не сможешь спамить, писать команды и использовать автоответчик!"
+    )
+    await call.message.edit_text(text, reply_markup=get_back_button())
+
+@router.callback_query(F.data == "tab_features")
+async def cb_tab_features(call: CallbackQuery):
+    text = (
+        "⚡️ <b>ПОЛНЫЙ ФУНКЦИОНАЛ (СКРЫТЫЕ КОМАНДЫ)</b>\n\n"
+        "Все команды пишутся <b>в любом чате</b> с точкой (например, <code>.info</code>) и удаляются ботом мгновенно!\n\n"
+        "🔎 <b>Шпионаж и Архивы:</b>\n"
+        "<code>.history 50</code> — Скачать файл истории чата\n"
+        "<code>.deleted 24</code> — Файл удаленных за 24 часа\n"
+        "<code>.find Текст</code> — Найти слово в переписке\n"
+        "<code>.info</code> — Статистика текущего чата\n\n"
+        "🤖 <b>Умный бот:</b>\n"
+        "<code>.status Я занят</code> — Автоответчик ВСЕМ\n"
+        "<code>.kw_add Привет -> Здарова</code> — Автоответ на слово\n"
+        "<code>.watch Имя</code> — Следить, если кто-то упомянет слово\n"
+        "<i>(Управление: .kw_list, .kw_del, .watch_list, .unwatch)</i>\n\n"
+        "🗂 <b>Шаблоны и Спам:</b>\n"
+        "<code>.save имя текст</code> — Сохранить шаблон (вызов: .имя)\n"
+        "<code>.remind 5m Текст</code> — Отправка через 5 минут\n"
+        "<code>.spam 10 Текст</code> — Отправить текст 10 раз\n"
+        "<code>.boom 5 Текст</code> — Самоуничтожение через 5 секунд\n\n"
+        "🛠 <b>Утилиты:</b>\n"
+        "<code>.calc 2+2*2</code>, <code>.qr текст</code>\n"
+        "<code>.short ссылка</code> (укоротить), <code>.unshort ссылка</code>\n"
+        "<code>.tr en Текст</code> (перевод на англ)\n"
+        "<code>.b64en текст</code> / <code>.b64de код</code> (шифровка Base64)"
+    )
+    await call.message.edit_text(text, reply_markup=get_back_button())
+
+async def render_settings_menu(user_id: int):
+    settings = await get_user_settings(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🗑 Перехват удаленных: {'✅' if settings['deleted'] else '❌'}", callback_data="set_deleted")],
         [InlineKeyboardButton(text=f"✏️ Перехват измененных: {'✅' if settings['edited'] else '❌'}", callback_data="set_edited")],
-        [InlineKeyboardButton(text=f"{'⏸ Поставить слежку на паузу' if not settings['paused'] else '▶️ Снять с паузы'}", callback_data="set_paused")]
+        [InlineKeyboardButton(text=f"{'⏸ Поставить слежку на паузу' if not settings['paused'] else '▶️ Снять с паузы'}", callback_data="set_paused")],
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_main")]
     ])
-    await message.answer("⚙️ <b>Настройки перехватчика:</b>", reply_markup=kb)
+    return kb
+
+@router.callback_query(F.data == "tab_settings")
+async def cb_tab_settings(call: CallbackQuery):
+    await call.message.edit_text("⚙️ <b>Настройки перехватчика:</b>", reply_markup=await render_settings_menu(call.from_user.id))
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message):
+    await message.answer("⚙️ <b>Настройки перехватчика:</b>", reply_markup=await render_settings_menu(message.from_user.id))
 
 @router.callback_query(F.data.startswith("set_"))
 async def cb_settings(call: CallbackQuery):
@@ -689,14 +679,9 @@ async def cb_settings(call: CallbackQuery):
     elif setting_type == "paused": await update_user_setting(call.from_user.id, "is_paused", int(not settings['paused']))
     
     await call.answer("Настройки обновлены!")
-    new_settings = await get_user_settings(call.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🗑 Перехват удаленных: {'✅' if new_settings['deleted'] else '❌'}", callback_data="set_deleted")],
-        [InlineKeyboardButton(text=f"✏️ Перехват измененных: {'✅' if new_settings['edited'] else '❌'}", callback_data="set_edited")],
-        [InlineKeyboardButton(text=f"{'⏸ Поставить слежку на паузу' if not new_settings['paused'] else '▶️ Снять с паузы'}", callback_data="set_paused")]
-    ])
-    await call.message.edit_reply_markup(reply_markup=kb)
+    await call.message.edit_reply_markup(reply_markup=await render_settings_menu(call.from_user.id))
 
+# ================= АДМИН КОМАНДЫ =================
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -705,11 +690,44 @@ async def cmd_stats(message: Message):
         async with db.execute("SELECT COUNT(DISTINCT user_id) FROM business_connections") as c: active = (await c.fetchone())[0]
         async with db.execute("SELECT stat_value FROM bot_stats WHERE stat_name = 'deleted_caught'") as c: r = await c.fetchone(); deleted = r[0] if r else 0
         async with db.execute("SELECT stat_value FROM bot_stats WHERE stat_name = 'edited_caught'") as c: r = await c.fetchone(); edited = r[0] if r else 0
+        
+        # Детальная стата БД
         async with db.execute("SELECT COUNT(*) FROM messages_v2") as c: db_size = (await c.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM archive_deleted") as c: arc_size = (await c.fetchone())[0]
+        
+        # Медиа стата
+        async with db.execute("SELECT COUNT(*) FROM messages_v2 WHERE content_type = 'photo'") as c: photo_c = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM messages_v2 WHERE content_type = 'video_note'") as c: vn_c = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM messages_v2 WHERE content_type = 'voice'") as c: voice_c = (await c.fetchone())[0]
+
+        # Стата юзербота
+        async with db.execute("SELECT COUNT(*) FROM user_notes") as c: notes_c = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM keyword_replies") as c: kw_c = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM global_status WHERE is_active=1") as c: status_c = (await c.fetchone())[0]
 
     delta = datetime.now() - BOT_START_TIME
-    await message.answer(f"📈 <b>СТАТИСТИКА:</b>\n👥 Юзеров: {total}\n🔗 Активных Premium: {active}\n🗑 Перехвачено: {deleted}\n✏️ Изменено: {edited}\n💾 В кэше: {db_size} | В архиве: {arc_size}\n⏳ Аптайм: {delta.days}д {delta.seconds//3600}ч {(delta.seconds//60)%60}м")
+    
+    text = (
+        "📈 <b>РАЗВЕРНУТАЯ СТАТИСТИКА:</b>\n\n"
+        f"👥 <b>Пользователи:</b>\n"
+        f"Всего юзеров: {total}\n"
+        f"Активных подключений: {active}\n\n"
+        f"🕵️‍♂️ <b>Работа перехватчика:</b>\n"
+        f"Удалено сообщений: {deleted}\n"
+        f"Изменено сообщений: {edited}\n\n"
+        f"💾 <b>База данных:</b>\n"
+        f"Кэш сообщений: {db_size}\n"
+        f"Архив удаленных: {arc_size}\n"
+        f"📸 Перехвачено фото: {photo_c}\n"
+        f"⭕️ Перехвачено кружков: {vn_c}\n"
+        f"🎤 Перехвачено войсов: {voice_c}\n\n"
+        f"🤖 <b>Модули юзербота:</b>\n"
+        f"Создано шаблонов: {notes_c}\n"
+        f"Триггеров автоответа: {kw_c}\n"
+        f"Включено статусов: {status_c}\n\n"
+        f"⏳ <b>Аптайм:</b> {delta.days}д {delta.seconds//3600}ч {(delta.seconds//60)%60}м"
+    )
+    await message.answer(text)
 
 @router.message(Command("backup"))
 async def cmd_backup(message: Message):
