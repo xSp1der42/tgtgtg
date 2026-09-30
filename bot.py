@@ -30,8 +30,7 @@ if not BOT_TOKEN or not ADMIN_ID:
 
 DB_NAME = "business_messages.db"
 BOT_USERNAME = "@nodelchat_bot"
-# ДОБАВЛЕН НОВЫЙ КАНАЛ В СПИСОК
-CHANNELS = ["@xSp1der42", "@neon9_news", "@RiffyOff"] 
+CHANNELS = ["@xSp1der42"] 
 BOT_START_TIME = datetime.now()
 MESSAGE_RETENTION_TIME = 604800 # 7 дней
 
@@ -574,11 +573,10 @@ async def cmd_start(message: Message, bot: Bot):
     await save_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     if not await check_subscription(bot, message.from_user.id):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Канал 1", url="https://t.me/xSp1der42"), InlineKeyboardButton(text="📢 Канал 2", url="https://t.me/neon9_news")],
-            [InlineKeyboardButton(text="📢 Канал 3", url="https://t.me/RiffyOff")],
+            [InlineKeyboardButton(text="🕷 Канал xSp1der42", url="https://t.me/xSp1der42")],
             [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
         ])
-        text = "🔓 <b>Бот ПОЛНОСТЬЮ БЕСПЛАТНЫЙ!</b>\n\nНо для доступа к его функциям, пожалуйста, подпишись на каналы наших спонсоров:"
+        text = "🔓 <b>Бот ПОЛНОСТЬЮ БЕСПЛАТНЫЙ!</b>\n\nНо для доступа к его функциям, пожалуйста, подпишись на наш канал:"
         return await message.answer(text, reply_markup=keyboard)
 
     welcome = (
@@ -597,7 +595,7 @@ async def cb_check_sub(call: CallbackQuery, bot: Bot):
         await call.message.delete()
         await cmd_start(call.message, bot)
     else:
-        await call.answer("❌ Вы не подписались на все каналы!", show_alert=True)
+        await call.answer("❌ Вы не подписались на канал!", show_alert=True)
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(call: CallbackQuery):
